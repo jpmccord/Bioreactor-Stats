@@ -1,5 +1,7 @@
 source("rawDataGeneration.R")
 
+library(fitdistrplus)
+
 ##### PFAS Measurement Summaries and subsetting ####
 
 PFASs <- colnames(final_raw)[3:72]
@@ -43,7 +45,7 @@ ggplot(summary_plot) +
 
 legacy_summary <- filter(summary_plot, PFAS %in% c("PFBA","PFDA","PFOA","PFHpA","PFHxA","PFNA","PFOA","PFOS","PFPeA", "PFHxS"))
 
-ggplot(filter(legacy_summary, phase == "peak")) +
+ggplot(filter(legacy_summary, phase != "lag")) +
   theme_minimal()+
   geom_point(aes(x = Days.Elapsed, y = conc, group = Reactor), size = 0.5) +
   geom_line(aes(x = Days.Elapsed, y = conc, group = Reactor, color = biotype)) +
@@ -60,8 +62,6 @@ ggplot(filter(telomer_summary, phase != "lag")) +
   geom_line(aes(x = Days.Elapsed, y = conc, group = Reactor, color = biotype)) +
   scale_y_log10() +
   facet_wrap(~PFAS)
-
-
 
 ###### OTHER COMPOUNDS #####
 
@@ -125,10 +125,11 @@ inputed_frame <- cbind(fitting_values, inputions) %>%
   mutate(quantiles = ifelse(is.na(inputions), log(raw_measure), inputions)) %>%
   dplyr::select(quantiles) %>%
   cbind(single_PFAS) %>%
-  mutate(conc = ifelse(raw_measure < cutoff, exp(quantiles) * dil, raw_measure*dil))
+  mutate(conc = ifelse(raw_measure < cutoff, exp(quantiles) * dil, raw_measure*dil),
+         Days.Elapsed = Days.Elapsed/10)
 #####
 
-model <- lmer(data = inputed_frame,
+model <- lmerTest::lmer(data = inputed_frame,
               log(conc) ~ Days.Elapsed + biotype + (Days.Elapsed|Reactor))
 
 model2 <- lmer(data = inputed_frame,
@@ -168,7 +169,7 @@ preds <- predict(model3, newdata = new.data, type = "response")
 
 inputed_frame <- left_join(inputed_frame, codings)
 
-ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
+ggplot(inputed_frame, aes(x = Days.Elapsed*10, group = Reactor)) +
   theme_classic()+
   guides(color = FALSE, fill =FALSE, linetype = FALSE)+
   geom_point(aes(y = conc,
@@ -182,6 +183,9 @@ ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
   #geom_line(aes(x= Days.Elapsed, y = predict(model5), color= phase, group = Reactor)) +
   facet_grid(biotype~Season)
 
+summary(model)
+
+(model)
 
 ########## PFOA ##########
 
@@ -277,7 +281,7 @@ preds <- predict(model3, newdata = new.data, type = "response")
 
 inputed_frame <- left_join(inputed_frame, codings)
 
-ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
+ggplot(inputed_frame, aes(x = Days.Elapsed*10, group = Reactor)) +
   theme_classic()+
   guides(color = FALSE, fill =FALSE, linetype = FALSE)+
   geom_point(aes(y = conc,
@@ -291,4 +295,5 @@ ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
   #geom_line(aes(x= Days.Elapsed, y = predict(model5), color= phase, group = Reactor)) +
   facet_grid(biotype~Season)
 
+summary(model)
 
