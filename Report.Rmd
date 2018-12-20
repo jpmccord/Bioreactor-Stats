@@ -1,0 +1,843 @@
+---
+title: "Bioreactor_Stats_Report"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+check.packages <- function(package){
+  new.package <- package[!(package %in% installed.packages()[, "Package"])]
+  if (length(new.package)) 
+    install.packages(new.package, dependencies = TRUE)
+  sapply(package, require, character.only = TRUE)
+}
+
+packages<-c("tidyverse", "readxl", "car", "MASS", "lme4", "arm", "here", "fitdistrplus", "emmeans")
+
+check.packages(packages)
+
+
+```
+
+# Data Input and Cleanup
+
+Read in PFAS and methane production data from database file. Also stored analytical LOQs and reactor coding by experimental factor. 
+
+```{r input}
+raw.inputs <- read_excel('Reactor Raws/Johnsie Clean Data 2.xlsx', sheet = 2)
+
+CH4.inputs <- read_excel('Reactor Raws/Johnsie Clean Data 2.xlsx', sheet = 1)
+
+LoQs <- read_excel('Reactor Raws/Johnsie Clean Data 2.xlsx', sheet = 3)
+LOQs <- structure(as.numeric(LoQs), names=colnames(LoQs))
+
+codings <- read_excel('Reactor Raws/Johnsie Clean Data 2.xlsx', sheet = 5) %>%
+  mutate(crossed_factors = paste0(Season,"_",biotype)) %>%
+  group_by(crossed_factors)%>%
+  mutate(dummy_rep = seq_along(crossed_factors))
+
+codings
+
+as.tibble(LOQs)
+```
+
+Single point imputation of missing data. Non-measurements days were dropped from the dataframe, values reported below LOQ were inputted at LoQ/sqrt(2), values as zero or ND were set at LOQ/10. These values will be replaced by later multipoint inputation on a per-compound basis if/when necessary. 
+
+```{r cleaning}
+clean_data <- raw.inputs %>%
+  dplyr::filter(!is.na(PFBA)) %>%
+  dplyr::select(-`Sample Date`, -`Date Analyzed`)
+
+for (i in 1:length(LOQs)) {
+  n = i+2
+  clean_data[which(clean_data[,(n)] == "<LOQ"),(n)] <- LOQs[i]/sqrt(2) 
+  clean_data[which(clean_data[,(n)] == "LOQ"),(n)] <- LOQs[i]/sqrt(2) 
+  clean_data[which(clean_data[,(n)] == "ND"),(n)] <- LOQs[i]/10
+  clean_data[which(clean_data[,(n)] == "0"),(n)] <- LOQs[i]/10
+}
+
+clean_data2 <- clean_data %>%
+  mutate_at(colnames(clean_data[2:72]), as.numeric)
+```
+
+Methane production levels used to define reactor "phases"."Lag" phase is the initial phase with production < 0.2, "decline" phase is the final phase with production < 0.2. "Peak" phase is the period of microbe activity. Phases will be used if strict Days.Elapsed models fail. 
+
+``` {r methane}
+CH4.phase <- CH4.inputs %>%
+  group_by(Reactor) %>%
+  summarize(max.CH4 = max(CH4)) %>%
+  left_join(CH4.inputs) %>%
+  mutate(peak.day = ifelse((CH4 == max.CH4), Days.Elapsed,NA)) %>%
+  dplyr::filter(!is.na(peak.day)) %>%
+  dplyr::select(peak.day,Reactor)%>%
+  full_join(CH4.inputs) %>%
+  mutate(phase = ifelse(CH4 < 0.2 & Days.Elapsed < peak.day, "lag", "peak"),
+         phase = ifelse(CH4 < 0.2 & Days.Elapsed > peak.day, "decline", phase)) %>%
+  dplyr::select(Days.Elapsed,Reactor,phase) %>%
+  dplyr::filter(!is.na(phase))
+  
+CH4.phase
+```
+  
+Each abiotic reactor was assigned a biotic reactor from its "Season" for the purpose of dummy coding phase (acts as a time variable if we do phase based comparisons)
+  
+``` {r phases}
+phase_factoring <- function(df,reactor.list,lag.knot,decline.knot) {
+  df %>% mutate(phase = case_when(Reactor %in% reactor.list & Days.Elapsed <= lag.knot ~ "lag",
+                                  Reactor %in% reactor.list & Days.Elapsed > lag.knot & Days.Elapsed < decline.knot ~ "peak",
+                                  Reactor %in% reactor.list & Days.Elapsed >= decline.knot ~ "decline",
+                                  TRUE ~ as.character(phase)))
+                
+}
+
+## assigned manually because I am too tired to write a general function
+final_raw <- clean_data2 %>% full_join(codings, by = "Reactor") %>% 
+  mutate(phase = "waiting") %>%
+  phase_factoring(c("P2"), 74, 220)%>%
+  phase_factoring(c("P3"), 311, 458)%>%
+  phase_factoring(c("P20"), 75, 335)%>%
+  phase_factoring(c("P21"), 67, 257)%>%
+  phase_factoring(c("P24"), 20, 140)%>%
+  phase_factoring(c("P25"), 33, 208)%>%
+  phase_factoring(c("P25"), 33, 208)%>%
+  phase_factoring(c("P7"), 20, 132)%>%
+  phase_factoring(c("P6"), 54, 193)%>%
+  phase_factoring(c("P4","P5"), 74, 220) %>%
+  phase_factoring(c("P22","P23"), 109, 296)%>%
+  phase_factoring(c("P26","P27"),26, 174) %>%
+  phase_factoring(c("P8","P9"), 37, 163) %>%
+  mutate_at(c("Reactor", "Season", "biotype","phase"), as.factor)
+  
+final_raw
+```
+
+# Exploratory Data Analysis
+
+## Overall Summaries
+
+Calculate some summary stats for each PFAS measurement across all reactors to see what we are working with. 
+
+``` {r summary_stats}
+PFASs <- colnames(final_raw)[3:72]
+
+means <- final_raw[PFASs] %>%
+  summarize_all(.funs = funs(mean))
+median <- final_raw[PFASs] %>%
+  summarize_all(.funs = funs(median))
+sd <- final_raw[PFASs] %>%
+  summarize_all(.funs = funs(sd))
+min <- final_raw[PFASs] %>%
+  summarize_all(.funs = funs(min))
+max <- final_raw[PFASs] %>%
+  summarize_all(.funs = funs(max))
+
+summaries <- bind_rows(means,median,sd,min,max) %>% as.data.frame()
+rownames(summaries) <- c("mean","median","sd","min","max")
+
+round(as.tibble(summaries), 2)
+```
+
+Some compounds show basically zero variation, others aren't detected hardly at all. Analysis will proceed on the "interesting" subset of compounds selected by Lang (DOI: 10.1021/acs.est.6b05005) with an additional filter to require a max detected concentration of 10. Other samples have too little variation to model. 
+
+```{r PFAS_subset}
+PFASs_subset <- c("PFBA","PFPeA","PFHxA","PFHpA","PFOA","PFNA","PFDA",
+  "FHEA","FHUEA","FPePA","FOEA","FHpPA",
+  "PFBS","PFHxS","PFOS",
+  "MeFBSAA","FTS.6.2","diPAP.6.2","diPAP.6.2.8.2","diPAP.8.2")
+
+subset2 <- PFASs_subset[which(summaries["max",PFASs_subset] > 10)]
+
+working_raws <- final_raw[subset2] %>%
+  cbind(final_raw[c("Days.Elapsed","dil","Reactor","Season","biotype","phase")])
+
+summary_plot <- working_raws %>%
+  gather(one_of(subset2), key = "PFAS", value = "raw_measure") %>%
+  mutate(conc = raw_measure * dil)
+
+as.tibble(summary_plot)
+```
+
+```{r summary_graphs}
+##### LEGACY COMPOUNDS #####
+
+legacy_summary <- filter(summary_plot, PFAS %in% c("PFBA","PFDA","PFOA","PFHpA","PFHxA","PFNA","PFOA","PFOS","PFPeA", "PFHxS"))
+
+ggplot(filter(legacy_summary)) +
+  theme_minimal()+
+  geom_point(aes(x = Days.Elapsed, y = conc, group = Reactor), size = 0.5) +
+  geom_line(aes(x = Days.Elapsed, y = conc, group = Reactor, color = biotype)) +
+  scale_y_log10() +
+  annotation_logticks(sides = "l")+
+  facet_wrap(~PFAS) +
+  labs(title ="Concentration v. Time for Legacy Compunds",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Dilution Corrected PFAS Concentration (ng/L)")
+
+
+##### F COMPOUNDS #####
+telomer_summary <- filter(summary_plot, PFAS %in% c("FHEA","FHUEA","FPePA","FHpPA","FTS.6.2"))
+
+ggplot(filter(telomer_summary)) +
+  theme_minimal()+
+  geom_point(aes(x = Days.Elapsed, y = conc, group = Reactor), size = 0.5) +
+  geom_line(aes(x = Days.Elapsed, y = conc, group = Reactor, color = biotype)) +
+  scale_y_log10() +
+  annotation_logticks(sides = "l")+
+  facet_wrap(~PFAS) +
+  labs(title ="Concentration v. Time for Fluorotelomer Compunds",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Dilution Corrected PFAS Concentration (ng/L)")
+
+
+
+###### OTHER COMPOUNDS #####
+
+other_summary <- filter(summary_plot, ! PFAS %in% telomer_summary$PFAS & ! PFAS %in% legacy_summary$PFAS)
+
+ggplot(filter(other_summary)) +
+  theme_minimal()+
+  geom_point(aes(x = Days.Elapsed, y = conc, group = Reactor), size = 0.5) +
+  geom_line(aes(x = Days.Elapsed, y = conc, group = Reactor, color = biotype)) +
+  scale_y_log10() +
+  annotation_logticks(sides = "l")+
+  facet_wrap(~PFAS)+
+  labs(title ="Concentration v. Time for detected PAPs and  Compunds",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Dilution Corrected PFAS Concentration (ng/L)") 
+```
+
+## Legacy Compound Modeling
+
+### PFBA
+
+Select PFBA for individual compound analysis. Exploratory graphs.
+``` {r PFBA_selecting}
+chosen_PFAS <- "PFBA"
+
+single_PFAS <- filter(summary_plot, PFAS == chosen_PFAS)
+
+levels(single_PFAS$phase) <- c("lag", "peak","decline")
+
+ggplot(single_PFAS) +
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2)+
+  theme_minimal()+
+  geom_point(aes(x = Days.Elapsed, y = raw_measure, group = Reactor), size = 0.5) +
+  geom_line(aes(x = Days.Elapsed, y = raw_measure, group = Reactor, color = biotype)) +
+  scale_y_log10() +
+  annotation_logticks(sides = "l")+
+  facet_wrap(~Reactor) +
+  labs(title ="Concentration v. Time for Legacy Compunds",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+qqnorm(single_PFAS$raw_measure)
+```
+
+Single value inputation is pretty clear from the QQ plot. LOQ is very high (~60ng/L) so 80% of measures should be some inputed value. 
+
+#### PFBA Multi-Value Inputation
+
+Fit a log-normal distribution based on truncated distribution with censored data (using _fitdistrplus_)
+
+``` {r PFBA_fitting}
+fitting_values <- tibble(raw_measure = single_PFAS$raw_measure) %>%
+  mutate(index1 = seq_len(nrow(.))) %>%
+  sample_n(size = nrow(.)) %>%
+  mutate(index2 = seq_len(nrow(.)))
+
+lower_bound <- round(LOQs[chosen_PFAS]/10, 5)
+sqrtloq <- round(LOQs[chosen_PFAS]/sqrt(2), 5)
+cutoff <- round(LOQs[chosen_PFAS],5)
+
+fitting_values <-  fitting_values %>%
+  arrange(raw_measure) %>%
+  mutate(raw_measure = round(raw_measure, 5)) %>%
+  mutate(left = case_when(raw_measure <= lower_bound ~ as.numeric(NA),
+                          raw_measure <= cutoff ~ lower_bound,
+                          TRUE ~ raw_measure)) %>%
+  mutate(right = case_when(raw_measure == lower_bound ~ lower_bound,
+                           raw_measure <= cutoff ~ cutoff,
+                           TRUE ~ raw_measure)) %>%
+  arrange(raw_measure)
+
+censdata <- fitting_values[c("left","right")] %>% as.data.frame() %>% arrange(left)
+
+trunc_dist <- fitdistcens(log(censdata), distr = "norm")
+
+plot(trunc_dist)
+```
+
+Reasonable fit I guess, we really are inputing 80% of the data so I am not sure it is actually meaningful.
+
+#### PFBA Multi-Point Inputation
+Going to do multi-point inputation instead of single point inputation. Assigned a random index to each censored data point, then fit with quantiles from the distribution fit above. 
+
+``` {r PFBA_inputation, fig.cap = "Inputed data points overlaid on line plot of original reported values"}
+
+trunc_quantiles <- unlist(quantile(trunc_dist, probs = seq(0,100,by=(100/(max(fitting_values$index1)+2)))/100)[1])[-1]
+
+lowestcens <- sum(fitting_values$raw_measure <= lower_bound)
+lowercens <- sum(fitting_values$raw_measure <= cutoff) - lowestcens
+
+lowestcens_quatiles <- trunc_quantiles[1:lowestcens]
+lowercens_quantiles <- trunc_quantiles[(lowestcens+1):(lowestcens+lowercens)]
+
+inputions <- c(lowestcens_quatiles,lowercens_quantiles)
+
+length(inputions) <- nrow(fitting_values)
+
+inputed_frame <- cbind(fitting_values, inputions) %>%
+  arrange(index1) %>%
+  mutate(quantiles = ifelse(is.na(inputions), log(raw_measure), inputions)) %>%
+  dplyr::select(quantiles) %>%
+  cbind(single_PFAS) %>%
+  mutate(conc = ifelse(raw_measure < LOQs[chosen_PFAS], exp(quantiles) * dil, raw_measure*dil)) %>%
+  left_join(codings) %>%
+  mutate(scaled_days = Days.Elapsed/100)
+
+graph <- ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
+  theme_classic()+
+  guides(color = FALSE, fill =FALSE, linetype = FALSE)+
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2) +
+  geom_point(aes(y = conc,
+                 color = as.factor(dummy_rep))) +
+  geom_line(aes(y = raw_measure*dil,
+                color = as.factor(dummy_rep))) +
+  scale_color_manual(values = c("blue","green"))+
+  facet_grid(biotype~Season) + 
+  labs(title ="Concentration v. Time for Bioreactor Replicates",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+plot(graph)
+```
+
+Added noise should allow for modeling.
+
+#### PFBA Modeling
+
+Building linear mixed effect models to account for experimental factors and nesting of Reactor %in% Season. Using scaled_days (Days/100) to allow for model convergence, this effect can be reversed during model interpretation.
+
+```{r PFBa_modeling}
+model <- lmer(data = inputed_frame,
+              log(conc) ~ scaled_days * biotype + Season + (scaled_days|Reactor))
+
+ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
+  theme_classic()+
+  guides(color = FALSE, fill =FALSE, linetype = FALSE)+
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2) +
+  geom_point(aes(y = conc,
+                 color = as.factor(dummy_rep))) +
+  geom_line(aes(y = exp(predict(model)),
+                color = as.factor(dummy_rep))) +
+  facet_grid(biotype~Season) + 
+  labs(title ="Measured vs. Modeled Reactor Concentrations",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+```
+
+#### Post-Hoc Comparison Testing
+
+Model summary:
+
+```{r PFBA_posthoc_1}
+
+summary(model)
+```
+
+Type II Wald p-values:
+
+```{r PFBA_Wald}
+afex::mixed(model, data = inputed_frame)
+
+```
+
+
+
+``` {r PFBA_emmeans}
+
+PFBA.emtrends <- emtrends(model, ~ Season + biotype + scaled_days:biotype, var = "scaled_days", transform = "response")
+emmeans.model <- emmeans(model, ~Season + biotype + scaled_days:biotype, transform = "response")
+
+CLD(PFBA.emtrends)
+    
+CLD(emmeans.model)
+
+plot(PFBA.emtrends, by = "Season", comparison = TRUE)
+
+plot(emtrends(model, ~ Season + biotype, var = "scaled_days", transform = "response"), by = "biotype", comparison = TRUE)
+
+plot(emmeans(model, ~ Season + biotype , transform = "response"), by = "biotype", comparison = TRUE)
+
+#emmip(model, ~ Season | biotype, transform = "response") +
+#  theme_bw()+
+#  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2)
+
+```
+
+### PFPeA
+
+Select PFPeA for individual compound analysis. Exploratory graphs.
+``` {r PFPeA_selecting}
+chosen_PFAS <- "PFPeA"
+
+single_PFAS <- filter(summary_plot, PFAS == chosen_PFAS)
+
+levels(single_PFAS$phase) <- c("lag", "peak","decline")
+
+ggplot(single_PFAS) +
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2)+
+  theme_minimal()+
+  geom_point(aes(x = Days.Elapsed, y = raw_measure, group = Reactor), size = 0.5) +
+  geom_line(aes(x = Days.Elapsed, y = raw_measure, group = Reactor, color = biotype)) +
+  scale_y_log10() +
+  annotation_logticks(sides = "l")+
+  facet_wrap(~Reactor) +
+  labs(title ="Concentration v. Time for Legacy Compunds",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+qqnorm(single_PFAS$raw_measure)
+```
+
+Single value inputation is pretty clear from the QQ plot. LOQ is slightly high (30ng/L) so ~50% of measures should be some inputed value. 
+
+#### PFPeA Multi-Value Inputation
+
+Fit a log-normal distribution based on truncated distribution with censored data (using _fitdistrplus_)
+
+``` {r PFPeA_fitting}
+fitting_values <- tibble(raw_measure = single_PFAS$raw_measure) %>%
+  mutate(index1 = seq_len(nrow(.))) %>%
+  sample_n(size = nrow(.)) %>%
+  mutate(index2 = seq_len(nrow(.)))
+
+lower_bound <- round(LOQs[chosen_PFAS]/10, 5)
+sqrtloq <- round(LOQs[chosen_PFAS]/sqrt(2), 5)
+cutoff <- round(LOQs[chosen_PFAS],5)
+
+fitting_values <-  fitting_values %>%
+  arrange(raw_measure) %>%
+  mutate(raw_measure = round(raw_measure, 5)) %>%
+  mutate(left = case_when(raw_measure <= lower_bound ~ as.numeric(NA),
+                          raw_measure <= cutoff ~ lower_bound,
+                          TRUE ~ raw_measure)) %>%
+  mutate(right = case_when(raw_measure == lower_bound ~ lower_bound,
+                           raw_measure <= cutoff ~ cutoff,
+                           TRUE ~ raw_measure)) %>%
+  arrange(raw_measure)
+
+censdata <- fitting_values[c("left","right")] %>% as.data.frame() %>% arrange(left)
+
+trunc_dist <- fitdistcens(log(censdata), distr = "norm")
+
+plot(trunc_dist)
+```
+
+Fairly long tail on the QQ-plot high side, we really are inputing 50% of the data so I am not sure it is actually meaningful.
+
+#### PFPeA Multi-Point Inputation
+Going to do multi-point inputation instead of single point inputation. Assigned a random index to each censored data point, then fit with quantiles from the distribution fit above. 
+
+``` {r PFPeA_inputation, fig.cap = "Inputed data points overlaid on line plot of original reported values"}
+
+trunc_quantiles <- unlist(quantile(trunc_dist, probs = seq(0,100,by=(100/(max(fitting_values$index1)+2)))/100)[1])[-1]
+
+lowestcens <- sum(fitting_values$raw_measure <= lower_bound)
+lowercens <- sum(fitting_values$raw_measure <= cutoff) - lowestcens
+
+lowestcens_quatiles <- trunc_quantiles[1:lowestcens]
+lowercens_quantiles <- trunc_quantiles[(lowestcens+1):(lowestcens+lowercens)]
+
+inputions <- c(lowestcens_quatiles,lowercens_quantiles)
+
+length(inputions) <- nrow(fitting_values)
+
+inputed_frame <- cbind(fitting_values, inputions) %>%
+  arrange(index1) %>%
+  mutate(quantiles = ifelse(is.na(inputions), log(raw_measure), inputions)) %>%
+  dplyr::select(quantiles) %>%
+  cbind(single_PFAS) %>%
+  mutate(conc = ifelse(raw_measure < LOQs[chosen_PFAS], exp(quantiles) * dil, raw_measure*dil)) %>%
+  left_join(codings) %>%
+  mutate(scaled_days = Days.Elapsed/100)
+
+graph <- ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
+  theme_classic()+
+  guides(color = FALSE, fill =FALSE, linetype = FALSE)+
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2) +
+  geom_point(aes(y = conc,
+                 color = as.factor(dummy_rep))) +
+  geom_line(aes(y = raw_measure*dil,
+                color = as.factor(dummy_rep))) +
+  scale_color_manual(values = c("blue","green"))+
+  facet_grid(biotype~Season) + 
+  labs(title ="Concentration v. Time for Bioreactor Replicates",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+plot(graph)
+```
+
+Added noise should allow for modeling.
+
+#### PFPeA Modeling
+
+Building linear mixed effect models to account for experimental factors and nesting of Reactor %in% Season. Using scaled_days (Days/100) to allow for model convergence, this effect can be reversed during model interpretation.
+
+```{r PFPeA_modeling}
+model <- lmer(data = inputed_frame,
+              log(conc) ~ scaled_days * biotype + Season + (1|Reactor))
+
+ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
+  theme_classic()+
+  guides(color = FALSE, fill =FALSE, linetype = FALSE)+
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2) +
+  geom_point(aes(y = conc,
+                 color = as.factor(dummy_rep))) +
+  geom_line(aes(y = exp(predict(model)),
+                color = as.factor(dummy_rep))) +
+  facet_grid(biotype~Season) + 
+  labs(title ="Measured vs. Modeled Reactor Concentrations",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+```
+
+#### Post-Hoc Comparison Testing
+
+Model summary:
+
+```{r PFPeA_posthoc_1}
+
+summary(model)
+```
+
+Type II Wald p-values:
+
+```{r PFPeA_Wald}
+afex::mixed(model, data = inputed_frame)
+
+```
+
+
+
+``` {r PFPeA_emmeans}
+
+PFPeA.emtrends.model <- emtrends(model, ~ Season + biotype + scaled_days:biotype, var = "scaled_days", transform = "response")
+PFPeA.emmeans.model <- emmeans(model, ~Season + biotype + scaled_days:biotype, transform = "response")
+
+CLD(PFPeA.emtrends.model)
+    
+CLD(PFPeA.emmeans.model)
+
+plot(PFPeA.emtrends.model, by = "Season", comparison = TRUE)
+
+plot(PFPeA.emtrends.model, by = "biotype", comparison = TRUE)
+
+plot(PFPeA.emmeans.model, by = "biotype", comparison = TRUE)
+
+#emmip(model, ~ Season | biotype, transform = "response") +
+#  theme_bw()+
+#  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2)
+
+```
+### PFHxA
+
+Select PFHxA for individual compound analysis. Exploratory graphs.
+``` {r PFHxA_selecting}
+chosen_PFAS <- "PFHxA"
+
+single_PFAS <- filter(summary_plot, PFAS == chosen_PFAS)
+
+levels(single_PFAS$phase) <- c("lag", "peak","decline")
+
+ggplot(single_PFAS) +
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2)+
+  theme_minimal()+
+  geom_point(aes(x = Days.Elapsed, y = raw_measure, group = Reactor), size = 0.5) +
+  geom_line(aes(x = Days.Elapsed, y = raw_measure, group = Reactor, color = biotype)) +
+  scale_y_log10() +
+  annotation_logticks(sides = "l")+
+  facet_wrap(~Reactor) +
+  labs(title ="Concentration v. Time for Legacy Compunds",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+unscaled_qq <- function() {
+qqnorm(single_PFAS$raw_measure)
+qqline(single_PFAS$raw_measure)
+}
+
+unscaled_qq()
+
+log_qq <- function() {
+  qqnorm(log(single_PFAS$raw_measure))
+qqline(log(single_PFAS$raw_measure))
+}
+
+log_qq()
+```
+
+Single value inputation is pretty clear from the QQ plot. log-scaled qq looks fairly normal, we can head straight into analysis. 
+
+#### PFHxA Multi-Value Inputation
+
+Fit a log-normal distribution based on truncated distribution with censored data (using _fitdistrplus_)
+
+``` {r PFHxA_fitting}
+fitting_values <- tibble(raw_measure = single_PFAS$raw_measure) %>%
+  mutate(index1 = seq_len(nrow(.))) %>%
+  sample_n(size = nrow(.)) %>%
+  mutate(index2 = seq_len(nrow(.)))
+
+lower_bound <- round(LOQs[chosen_PFAS]/10, 5)
+sqrtloq <- round(LOQs[chosen_PFAS]/sqrt(2), 5)
+cutoff <- round(LOQs[chosen_PFAS],5)
+
+fitting_values <-  fitting_values %>%
+  arrange(raw_measure) %>%
+  mutate(raw_measure = round(raw_measure, 5)) %>%
+  mutate(left = case_when(raw_measure <= lower_bound ~ as.numeric(NA),
+                          raw_measure <= cutoff ~ lower_bound,
+                          TRUE ~ raw_measure)) %>%
+  mutate(right = case_when(raw_measure == lower_bound ~ lower_bound,
+                           raw_measure <= cutoff ~ cutoff,
+                           TRUE ~ raw_measure)) %>%
+  arrange(raw_measure)
+
+censdata <- fitting_values[c("left","right")] %>% as.data.frame() %>% arrange(left)
+
+trunc_dist <- fitdistcens(log(censdata), distr = "norm")
+
+plot(trunc_dist)
+```
+
+No censored data so fits a log-normal dist pretty cleanly as we saw from the previous QQ-Plots
+
+``` {r PFHxA_inputation, fig.cap = "Inputed data points overlaid on line plot of original reported values", echo =FALSE}
+
+trunc_quantiles <- unlist(quantile(trunc_dist, probs = seq(0,100,by=(100/(max(fitting_values$index1)+2)))/100)[1])[-1]
+
+lowestcens <- sum(fitting_values$raw_measure <= lower_bound)
+lowercens <- sum(fitting_values$raw_measure <= cutoff) - lowestcens
+
+lowestcens_quatiles <- trunc_quantiles[1:lowestcens]
+lowercens_quantiles <- trunc_quantiles[(lowestcens+1):(lowestcens+lowercens)]
+
+inputions <- c(lowestcens_quatiles,lowercens_quantiles)
+
+length(inputions) <- nrow(fitting_values)
+
+inputed_frame <- cbind(fitting_values, inputions) %>%
+  arrange(index1) %>%
+  mutate(quantiles = ifelse(is.na(inputions), log(raw_measure), inputions)) %>%
+  dplyr::select(quantiles) %>%
+  cbind(single_PFAS) %>%
+  mutate(conc = ifelse(raw_measure < LOQs[chosen_PFAS], exp(quantiles) * dil, raw_measure*dil)) %>%
+  left_join(codings) %>%
+  mutate(scaled_days = Days.Elapsed/100)
+
+graph <- ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
+  theme_classic()+
+  guides(color = FALSE, fill =FALSE, linetype = FALSE)+
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2) +
+  geom_point(aes(y = conc,
+                 color = as.factor(dummy_rep))) +
+  geom_line(aes(y = raw_measure*dil,
+                color = as.factor(dummy_rep))) +
+  scale_color_manual(values = c("blue","green"))+
+  facet_grid(biotype~Season) + 
+  labs(title ="Concentration v. Time for Bioreactor Replicates",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+plot(graph)
+```
+
+
+
+#### PFHxA Modeling
+
+Building linear mixed effect models to account for experimental factors and nesting of Reactor %in% Season. Using scaled_days (Days/100) to allow for model convergence, this effect can be reversed during model interpretation.
+
+```{r PFHxA_modeling}
+model <- lmer(data = inputed_frame,
+              log(conc) ~ scaled_days * biotype + Season + (1|Reactor))
+
+ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
+  theme_classic()+
+  guides(color = FALSE, fill =FALSE, linetype = FALSE)+
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2) +
+  geom_point(aes(y = conc,
+                 color = as.factor(dummy_rep))) +
+  geom_line(aes(y = exp(predict(model)),
+                color = as.factor(dummy_rep))) +
+  facet_grid(biotype~Season) + 
+  labs(title ="Measured vs. Modeled Reactor Concentrations",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+```
+
+#### Post-Hoc Comparison Testing
+
+Model summary:
+
+```{r PFHxA_posthoc_1}
+
+summary(model)
+```
+
+Type II Wald p-values:
+
+```{r PFHxA_Wald}
+afex::mixed(model, data = inputed_frame)
+
+```
+
+No statistically significant differences based on Reactor, Season, or time. Only significant parameter is likely physical release _(?)_ over time
+
+### PFHpA
+
+Select PFHpA for individual compound analysis. Exploratory graphs.
+``` {r PFHpA_selecting}
+chosen_PFAS <- "PFHpA"
+
+single_PFAS <- filter(summary_plot, PFAS == chosen_PFAS)
+
+levels(single_PFAS$phase) <- c("lag", "peak","decline")
+
+ggplot(single_PFAS) +
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2)+
+  theme_minimal()+
+  geom_point(aes(x = Days.Elapsed, y = raw_measure, group = Reactor), size = 0.5) +
+  geom_line(aes(x = Days.Elapsed, y = raw_measure, group = Reactor, color = biotype)) +
+  scale_y_log10() +
+  annotation_logticks(sides = "l")+
+  facet_wrap(~Reactor) +
+  labs(title ="Concentration v. Time for Legacy Compunds",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+unscaled_qq <- function() {
+qqnorm(single_PFAS$raw_measure)
+qqline(single_PFAS$raw_measure)
+}
+
+unscaled_qq()
+
+log_qq <- function() {
+  qqnorm(log(single_PFAS$raw_measure))
+qqline(log(single_PFAS$raw_measure))
+}
+
+log_qq()
+```
+
+QQ plot almost normal, log-scaling clears upper end long tail. Using log-scaled data for consistent modeling.  
+
+
+``` {r PFHpA_inputation, echo = FALSE}
+
+trunc_quantiles <- unlist(quantile(trunc_dist, probs = seq(0,100,by=(100/(max(fitting_values$index1)+2)))/100)[1])[-1]
+
+lowestcens <- sum(fitting_values$raw_measure <= lower_bound)
+lowercens <- sum(fitting_values$raw_measure <= cutoff) - lowestcens
+
+lowestcens_quatiles <- trunc_quantiles[1:lowestcens]
+lowercens_quantiles <- trunc_quantiles[(lowestcens+1):(lowestcens+lowercens)]
+
+inputions <- c(lowestcens_quatiles,lowercens_quantiles)
+
+length(inputions) <- nrow(fitting_values)
+
+inputed_frame <- cbind(fitting_values, inputions) %>%
+  arrange(index1) %>%
+  mutate(quantiles = ifelse(is.na(inputions), log(raw_measure), inputions)) %>%
+  dplyr::select(quantiles) %>%
+  cbind(single_PFAS) %>%
+  mutate(conc = ifelse(raw_measure < LOQs[chosen_PFAS], exp(quantiles) * dil, raw_measure*dil)) %>%
+  left_join(codings) %>%
+  mutate(scaled_days = Days.Elapsed/100)
+
+graph <- ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
+  theme_classic()+
+  guides(color = FALSE, fill =FALSE, linetype = FALSE)+
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2) +
+  geom_point(aes(y = conc,
+                 color = as.factor(dummy_rep))) +
+  geom_line(aes(y = raw_measure*dil,
+                color = as.factor(dummy_rep))) +
+  scale_color_manual(values = c("blue","green"))+
+  facet_grid(biotype~Season) + 
+  labs(title ="Concentration v. Time for Bioreactor Replicates",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+plot(graph)
+```
+
+#### PFHpA Modeling
+
+Building linear mixed effect models to account for experimental factors and nesting of Reactor %in% Season. Using scaled_days (Days/100) to allow for model convergence, this effect can be reversed during model interpretation.
+
+```{r PFHpA_modeling}
+model <- lmer(data = inputed_frame,
+              log(conc) ~ scaled_days * biotype + (1|Season/Reactor))
+
+ggplot(inputed_frame, aes(x = Days.Elapsed, group = Reactor)) +
+  theme_classic()+
+  guides(color = FALSE, fill =FALSE, linetype = FALSE)+
+  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2) +
+  geom_point(aes(y = conc,
+                 color = as.factor(dummy_rep))) +
+  geom_line(aes(y = exp(predict(model)),
+                color = as.factor(dummy_rep))) +
+  facet_grid(biotype~Season) + 
+  labs(title ="Measured vs. Modeled Reactor Concentrations",
+       x ="Days Elapsed Since Reactor Start",
+       y ="Concentration (ng/L) + LOQ(dashed)")
+
+```
+
+#### Post-Hoc Comparison Testing
+
+Model summary:
+
+```{r PFHpA_posthoc_1}
+
+summary(model)
+```
+
+Type II Wald p-values:
+
+```{r PFHpA_Wald}
+afex::mixed(model, data = inputed_frame)
+
+```
+
+
+
+``` {r PFHpA_emmeans}
+
+PFHpA.emtrends.model <- emtrends(model, ~ scaled_days + Season + biotype + scaled_days:biotype, var = "scaled_days", transform = "response")
+PFHpA.emmeans.model <- emmeans(model, ~scaled_days + Season + biotype + scaled_days:biotype, transform = "response")
+
+CLD(PFHpA.emtrends.model)
+    
+CLD(PFHpA.emmeans.model)
+
+plot(PFHpA.emtrends.model, by = "Season", comparison = TRUE)
+
+plot(PFHpA.emtrends.model, by = "biotype", comparison = TRUE)
+
+plot(PFHpA.emmeans.model, by = "biotype", comparison = TRUE)
+
+#emmip(model, ~ Season | biotype, transform = "response") +
+#  theme_bw()+
+#  geom_hline(yintercept = LOQs[chosen_PFAS], linetype = 2)
+
+```

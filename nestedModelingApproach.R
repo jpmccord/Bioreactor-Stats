@@ -7,15 +7,15 @@ library(fitdistrplus)
 PFASs <- colnames(final_raw)[3:72]
 
 means <- final_raw[PFASs] %>%
-  summarize_all(.funs = funs(mean))
+  summarize_all(.funs = funs(mean), na.rm = TRUE)
 median <- final_raw[PFASs] %>%
-  summarize_all(.funs = funs(median))
+  summarize_all(.funs = funs(median), na.rm = TRUE)
 sd <- final_raw[PFASs] %>%
-  summarize_all(.funs = funs(sd))
+  summarize_all(.funs = funs(sd), na.rm = TRUE)
 min <- final_raw[PFASs] %>%
-  summarize_all(.funs = funs(min))
+  summarize_all(.funs = funs(min), na.rm = TRUE)
 max <- final_raw[PFASs] %>%
-  summarize_all(.funs = funs(max))
+  summarize_all(.funs = funs(max), na.rm = TRUE)
 
 summaries <- bind_rows(means,median,sd,min,max) %>% as.data.frame()
 rownames(summaries) <- c("mean","median","sd","min","max")
@@ -45,7 +45,7 @@ ggplot(summary_plot) +
   xlab("Days Elapsed") +
   ylab("Measured Concentration (ng/L)")
 
-inpute_data <- function(data) {
+impute_data <- function(data) {
   
   chosen_PFAS <- unique(data$PFAS)
   
@@ -53,6 +53,7 @@ inpute_data <- function(data) {
   
   #####fitting truncated distribution
   fitting_values <- tibble(raw_measure = data$raw_measure) %>%
+    filter(!is.na(raw_measure)) %>%
     mutate(index1 = seq_len(nrow(.))) %>%
     sample_n(size = nrow(.)) %>%
     mutate(index2 = seq_len(nrow(.)))
@@ -92,7 +93,7 @@ inpute_data <- function(data) {
     arrange(index1) %>%
     mutate(quantiles = ifelse(is.na(inputions), log(raw_measure), inputions)) %>%
     dplyr::select(quantiles) %>%
-    cbind(data) %>%
+    cbind(filter(data, !is.na(raw_measure))) %>%
     mutate(conc = ifelse(raw_measure < cutoff, exp(quantiles) * dil, raw_measure*dil),
            Days.Elapsed.Trans = Days.Elapsed/10)
 
@@ -100,7 +101,7 @@ inpute_data <- function(data) {
 }
 
 model_PFAS <- function(data) {
-  model <- lmerTest::lmer(data = data, log(conc) ~ Days.Elapsed.Trans + biotype + Season + (Days.Elapsed.Trans|Reactor))
+  model <- lmerTest::lmer(data = data, log(conc) ~ Days.Elapsed.Trans * biotype + Days.Elapsed.Trans*Season + (Days.Elapsed.Trans|Reactor))
   
   return(model)
 }
@@ -131,12 +132,12 @@ nested_analysis <- summary_plot %>%
   mutate(PFAS_holder = PFAS) %>%
   group_by(PFAS_holder) %>%
   nest() %>%
-  mutate(inputed_data = map(.x = data, .f = inpute_data),
+  mutate(inputed_data = map(.x = data, .f = impute_data),
          model = map(.x = inputed_data, .f = model_PFAS),
          model_sum = map(.x = model, .f = summary))
 
 
-pdf("Individual_Models.pdf", paper = "USr")
+pdf("Individual_Models_Cross-term.pdf", paper = "USr")
 for(rownum in 1:length(nested_analysis$PFAS_holder)) {
   print(plot_results(rownum))
 }
@@ -157,18 +158,18 @@ coef_summary <- nested_analysis %>%
   unnest(coefs) 
 
 
-formatted_table <- select(coef_summary, PFAS_holder, Estimate, vars) %>%
+formatted_table <- dplyr::select(coef_summary, PFAS_holder, Estimate, vars) %>%
   spread(PFAS_holder, Estimate) %>%
   mutate_at(.vars = vars(-vars), signif, digits = 1) %>%
   t() %>%
   as_tibble() %>%
   slice(-1) %>%
   setNames(unique(coef_summary$vars)) %>%
-  mutate(Days.Elapsed.Trans = as.numeric(Days.Elapsed.Trans)/10) %>%
+  #mutate(Days.Elapsed.Trans = as.numeric(Days.Elapsed.Trans)/10) %>%
   rename(Days.Elapsed = Days.Elapsed.Trans) %>%
   t() %>% t()
 
-formatted_pval <- select(coef_summary, PFAS_holder, `Pr(>|t|)`, vars) %>%
+formatted_pval <- dplyr::select(coef_summary, PFAS_holder, `Pr(>|t|)`, vars) %>%
   spread(PFAS_holder, `Pr(>|t|)`) %>%
   mutate_at(.vars = vars(-vars), signif, digits = 1) %>%
   t() %>%
@@ -178,7 +179,7 @@ formatted_pval <- select(coef_summary, PFAS_holder, `Pr(>|t|)`, vars) %>%
   t() %>% t()
 
 
-for_paper = matrix(paste0(formatted_table,"(",formatted_pval,")"), ncol = 6) %>%
+for_paper = matrix(paste0(formatted_table,"(",formatted_pval,")"), ncol = 7) %>%
   as.tibble()
 
 colnames(for_paper) = colnames(formatted_table)
